@@ -119,6 +119,8 @@ Testing notebook.ipynb
 /*.png
 /*.zip
 /*.tar.*
-# A3 data (shared on OneDrive, too big for git)
-data/raw/
-data/processed/
+
+# Local assignment datasets and trained models
+/data/raw/
+/data/processed/
+/data/models/
