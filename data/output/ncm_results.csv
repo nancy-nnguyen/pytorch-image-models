@@ -1,0 +1,4 @@
+model,set,rows,top1,top5,predict_s
+"raw, Euclidean",val,50000,0.94644,0.99584,4.154397487640381
+"raw, Euclidean",test1,50000,0.89926,0.988,3.0378775596618652
+"raw, Euclidean",test2,10000,0.8267,0.961,0.6103165149688721
