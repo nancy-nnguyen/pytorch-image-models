@@ -1,18 +1,4 @@
-# 05_generalisation_analysis.py - Part 5: generalisation analysis (Rifa)
-#
-# Why is accuracy lower on test set 2 (ImageNetV2) than on test set 1 (ImageNet val)?
-# Reads the per-image predictions saved by the three classifier scripts, then compares the two test sets
-#   overall (with a confidence interval on the gap),
-#   with and without the test set 1 images whose features exactly match a training image,
-#   per class (with a significance test, because test set 2 has only 10 images per class),
-#   in feature space (class-centroid shift, measured against a sampling-noise baseline),
-#   by typicality (how close each image is to the training centroid of its own class),
-#   per feature (which of the 1,024 features shift, and which separate classes on one set but not the other),
-#   by cluster (k-means groups of similar images, fitted on training data),
-#   and by looking at the misclassified ImageNetV2 images.
-# Nothing here trains a classifier, and nothing is fitted on a test set: the centroids, PCA and k-means are
-# fitted on train_small only. Run after the three classifier scripts:
-#   python code/05_generalisation_analysis.py --v2-images <folder holding imagenetv2-matched-frequency-format-val>
+# 05_generalisation_analysis.py - why accuracy drops on test set 2 (ImageNetV2) vs test set 1 (ImageNet val)
 
 import argparse
 import hashlib
@@ -21,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")                      # figures are saved, never shown, so the script runs without a display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image
 from scipy import stats
@@ -33,7 +19,7 @@ plt.rcParams.update({"font.size": 11})
 ROOT = Path(__file__).resolve().parent.parent
 PROC = ROOT / "data" / "processed"
 OUT = ROOT / "data" / "output"
-INFO = ROOT / "timm" / "data" / "_info"    # ImageNet class ids and names, shipped with timm
+INFO = ROOT / "timm" / "data" / "_info"    # ImageNet class names, shipped with timm
 OUT.mkdir(parents=True, exist_ok=True)
 
 parser = argparse.ArgumentParser(description="A3 part (b): why accuracy drops on ImageNetV2")
@@ -44,14 +30,13 @@ args = parser.parse_args()
 
 SEED = 7
 N_CLASSES = 1000
-NULL_SPLITS = 20                           # random splits per class for the centroid-shift noise baseline
-TYPICALITY_BINS = 10                       # deciles of test set 1's typicality
-ETA_REPEATS = 5                            # random 10-per-class samples of test set 1, to match test set 2's size
-PCA_DIMS, N_CLUSTERS = 128, 50             # k-means on the top principal components of train_small
+NULL_SPLITS = 20
+TYPICALITY_BINS = 10
+ETA_REPEATS = 5
+PCA_DIMS, N_CLUSTERS = 128, 50
 BLUE, ORANGE, GREY = "#2a78d6", "#eb6834", "#888888"
 
-# Classifier A is the one chosen for part (a): it has the best top-1 on our validation set
-# (A 95.23%, B 95.01%, C 94.64%). Per-class and feature-space results use it.
+# A has the best validation top-1, so it is the one used from section 5 on
 NAMES = {"A": "Regularised linear", "B": "Small MLP", "C": "Nearest centroid"}
 PRIMARY = "A"
 
@@ -62,7 +47,6 @@ X = {t: np.load(PROC / f"{t}_X.npy") for t in ("test1", "test2")}
 n = {t: len(y[t]) for t in y}
 print("test1 rows:", n["test1"], " test2 rows:", n["test2"])
 
-# label i is the i-th WordNet id in imagenet_synsets.txt; the test set 1 paths (val/<wnid>/...) confirm it
 wnids = (INFO / "imagenet_synsets.txt").read_text().split()
 lemmas = dict(line.split("\t", 1) for line in (INFO / "imagenet_synset_to_lemma.txt").read_text().splitlines())
 class_name = np.array([lemmas[w].split(",")[0] for w in wnids])
@@ -72,21 +56,20 @@ if not (meta1.path.str.split("/").str[1].to_numpy() == np.array(wnids)[y["test1"
 
 
 # 2. Load the predictions of each classifier
-# each script saves its own format; all are turned into an (n, k) array of predicted classes, best first
-# (k = 5 when the top-5 is saved, k = 1 when only the top-1 is)
-def read_a(test):        # code/classifier_a_evaluate.py
+# each script saves its own format; all become an (n, k) array of classes, best first
+def read_a(test):
     df = pd.read_csv(OUT / f"classifier_a_{test}_predictions.csv")
     return df.true_label.to_numpy(), df[[f"top{k}_label" for k in range(1, 6)]].to_numpy()
 
 
-def read_b(test):        # code/03_mlp_classifier.py: one file for both test sets
+def read_b(test):
     df = pd.read_csv(OUT / "mlp_predictions.csv")
     df = df[df.test_set == test].sort_values("row")
     top = [c for c in ("pred1", "pred2", "pred3", "pred4", "pred5") if c in df] or ["pred"]
     return df.label.to_numpy(), df[top].to_numpy()
 
 
-def read_c(test):        # code/03_nearest_centroid.py
+def read_c(test):
     df = pd.read_csv(OUT / f"ncm_predictions_{test}.csv").sort_values("row")
     return df.label.to_numpy(), df[[f"pred{k}" for k in range(1, 6)]].to_numpy()
 
@@ -99,8 +82,6 @@ for clf, reader in (("A", read_a), ("B", read_b), ("C", read_c)):
         print(f"Skipping classifier {clf}: {e.filename} not found (run its script first)")
         continue
     for t, (labels, _) in loaded.items():
-        # the rows must be in the same order as data/processed/<test>_y.npy, or every comparison below is wrong;
-        # matching labels catch a wrong or truncated file, not a reshuffle within one class
         if not np.array_equal(labels, y[t]):
             raise ValueError(f"Classifier {clf}, {t}: labels do not match {t}_y.npy (wrong, truncated or reordered file)")
     preds[clf] = {t: top for t, (_, top) in loaded.items()}
@@ -111,7 +92,6 @@ print("Loaded predictions for", [NAMES[c] for c in classifiers])
 
 
 # 3. Overall accuracy and the gap
-# the gap's 95% interval treats the two test sets as independent samples: SE = sqrt(p1 q1 / n1 + p2 q2 / n2)
 def gap_row(clf, label, correct1, correct2, top5_1=np.nan, top5_2=np.nan):
     p1, p2 = correct1.mean(), correct2.mean()
     se = np.sqrt(p1 * (1 - p1) / len(correct1) + p2 * (1 - p2) / len(correct2))
@@ -123,16 +103,14 @@ def gap_row(clf, label, correct1, correct2, top5_1=np.nan, top5_2=np.nan):
 correct = {c: {t: preds[c][t][:, 0] == y[t] for t in y} for c in classifiers}
 rows = []
 for c in classifiers:
-    # top-5 only when the script saved five predictions per row (the MLP currently saves the top-1 only)
+    # NaN when only the top-1 was saved (the MLP)
     top5 = {t: (preds[c][t] == y[t][:, None]).any(axis=1).mean() if preds[c][t].shape[1] == 5 else np.nan
             for t in y}
     rows.append(gap_row(c, "all test1", correct[c]["test1"], correct[c]["test2"], top5["test1"], top5["test2"]))
 
 
-# 4. Test set 1 images whose features exactly match a training image
-# identical 1,024-d vectors mean identical input images. Every match found so far carries a different label
-# from its training twin, mostly a neighbouring class (e.g. tiger shark / great white shark), so these
-# images are label-ambiguous. They lower test set 1 accuracy, which hides part of the gap.
+# 4. Test set 1 images that are also in the training data
+# identical features = identical image; each one carries a different label in train
 def row_hash(r):
     return hashlib.md5(r.tobytes()).digest()
 
@@ -140,7 +118,7 @@ def row_hash(r):
 test1_hash = {}
 for i, r in enumerate(X["test1"]):
     test1_hash.setdefault(row_hash(r), []).append(i)
-X_train = np.load(PROC / "train_full_X.npy", mmap_mode="r")      # 5 GB, so read 100,000 rows at a time
+X_train = np.load(PROC / "train_full_X.npy", mmap_mode="r")
 duplicate = np.zeros(n["test1"], dtype=bool)
 for start in range(0, len(X_train), 100_000):
     for r in np.asarray(X_train[start:start + 100_000]):
@@ -158,10 +136,8 @@ print(overall[["classifier", "subset", "test1_rows", "test1_top1", "test2_top1",
                "gap", "gap_ci_low", "gap_ci_high"]].round(4).to_string(index=False))
 
 
-# 5. Per-class accuracy, tested for significance
-# test set 2 has 10 images per class, so one image moves a class's accuracy by 10 points; a raw ranking of
-# per-class gaps is mostly noise. Each class gets Fisher's exact test (test1 50 images vs test2 10 images),
-# and the 1,000 p-values are corrected for multiple testing (Benjamini-Hochberg false discovery rate).
+# 5. Per-class gap
+# only 10 images per class in test set 2, so each class is tested (Fisher, FDR-corrected)
 def per_class(clf):
     k1 = np.bincount(y["test1"], weights=correct[clf]["test1"], minlength=N_CLASSES)
     k2 = np.bincount(y["test2"], weights=correct[clf]["test2"], minlength=N_CLASSES)
@@ -177,8 +153,7 @@ for c in classifiers:
     class_gaps[c].to_csv(OUT / f"gen_perclass_{c}.csv", index=False)
 pc = class_gaps[PRIMARY]
 
-# what the per-class gaps would look like if nothing differed between the test sets: every class keeps one
-# accuracy (pooled over both sets) and only the random draw of 50 and 10 images varies
+# the per-class gaps sampling noise alone would give
 rng = np.random.default_rng(SEED)
 pooled = (pc.acc_test1 * 50 + pc.acc_test2 * 10) / 60
 null_gaps = (rng.binomial(50, np.tile(pooled, 20)) / 50 - rng.binomial(10, np.tile(pooled, 20)) / 10)
@@ -190,8 +165,8 @@ print("\n=== 20 classes with the strongest evidence of a drop ===")
 print(worst[["class", "name", "acc_test1", "acc_test2", "gap", "p_value", "q_value"]].round(3).to_string(index=False))
 
 
-# 6. Error patterns on those classes
-# for the 10 classes above, the most common wrong predictions on test set 2, for every classifier
+# 6. Error patterns
+# the most common wrong predictions on test set 2, for the 10 classes above
 errors = []
 for c in classifiers:
     for k in worst["class"].head(10):
@@ -204,10 +179,8 @@ pd.DataFrame(errors).to_csv(OUT / "gen_error_patterns.csv", index=False)
 print("\nError patterns saved to gen_error_patterns.csv")
 
 
-# 7. Feature space: how far each class's centroid moves between the test sets
-# a centroid of 10 images is noisy, so two samples of the SAME distribution already sit apart. The baseline
-# is the distance between the centroids of 10 random test1 images and the other 40 of that class
-# (NULL_SPLITS random splits, averaged); "excess" = observed distance minus that baseline.
+# 7. Class centroid shift
+# baseline: distance between 10 and 40 test1 images of the same class
 centroid_dist, baseline = np.zeros(N_CLASSES), np.zeros(N_CLASSES)
 for k in range(N_CLASSES):
     A, B = X["test1"][y["test1"] == k], X["test2"][y["test2"] == k]
@@ -228,7 +201,6 @@ for c in classifiers:
 
 
 # 8. Figures
-# 8a. top-1 on both test sets, with the binomial 95% interval of each accuracy
 main = overall[overall.subset == "all test1"]
 fig, ax = plt.subplots(figsize=(7.5, 4))
 x, w = np.arange(len(main)), 0.35
@@ -247,7 +219,6 @@ ax.spines[["top", "right"]].set_visible(False)
 plt.savefig(OUT / "fig_gen_overall.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-# 8b. per-class gaps against what sampling noise alone would produce
 fig, ax = plt.subplots(figsize=(6.5, 3.8))
 bins = np.linspace(-1, 1, 41)
 ax.hist(pc.gap, bins=bins, color=BLUE, alpha=0.85, edgecolor="white", label="observed")
@@ -262,10 +233,9 @@ ax.spines[["top", "right"]].set_visible(False)
 plt.savefig(OUT / "fig_gen_gap_hist.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-# 8c. excess centroid shift vs the class gap; significant classes highlighted
 fig, ax = plt.subplots(figsize=(6.2, 5))
 significant = (pc.q_value < 0.05).to_numpy()
-jitter = rng.uniform(-0.015, 0.015, N_CLASSES)       # gaps come in steps of 0.02 / 0.1, so points would stack
+jitter = rng.uniform(-0.015, 0.015, N_CLASSES)       # gaps come in steps, so points would stack
 ax.scatter(shift.excess_shift[~significant], pc.gap[~significant] + jitter[~significant], s=14, alpha=0.5, color=BLUE,
            label="not significant")
 ax.scatter(shift.excess_shift[significant], pc.gap[significant] + jitter[significant], s=22, color=ORANGE,
@@ -280,11 +250,8 @@ plt.savefig(OUT / "fig_gen_shift_vs_gap.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 
-
-# 9. Typicality: how close is each test image to the training centroid of its own class?
-# Recht et al. found ImageNetV2 images are "harder". If that is the whole story, an ImageNetV2 image and a
-# test set 1 image that are equally typical should be classified equally well, and the gap should come from
-# test set 2 having more atypical images. Typicality = cosine similarity to the class centroid of train_small.
+# 9. Typicality
+# cosine similarity of each test image to its own class centroid in train_small
 def unit(Z):
     return Z / np.linalg.norm(Z, axis=1, keepdims=True)
 
@@ -296,7 +263,6 @@ np.add.at(train_centroid, y_small, unit(X_small))
 train_centroid = unit(train_centroid)
 typical = {t: (unit(X[t]) * train_centroid[y[t]]).sum(axis=1) for t in y}
 
-# bins are the deciles of test set 1, so each holds 10% of test set 1
 edges = np.quantile(typical["test1"], np.linspace(0, 1, TYPICALITY_BINS + 1))[1:-1]
 bin_of = {t: np.digitize(typical[t], edges) for t in y}
 share = {t: np.bincount(bin_of[t], minlength=TYPICALITY_BINS) / n[t] for t in y}
@@ -307,8 +273,7 @@ for c in classifiers:
     for b in range(TYPICALITY_BINS):
         typ_rows.append({"classifier": NAMES[c], "bin": b + 1, "share_test1": share["test1"][b],
                          "share_test2": share["test2"][b], "acc_test1": acc["test1"][b], "acc_test2": acc["test2"][b]})
-    # test set 1's accuracy in each bin, weighted by how test set 2 is spread over the bins: the accuracy
-    # test set 2 would get if only its mix of typical and atypical images differed
+    # test set 2's accuracy if only its mix of typical and atypical images differed
     expected2 = np.nansum(share["test2"] * acc["test1"])
     acc1, acc2 = correct[c]["test1"].mean(), correct[c]["test2"].mean()
     explained.append({"classifier": NAMES[c], "test1_top1": acc1, "test2_top1": acc2,
@@ -343,16 +308,14 @@ plt.savefig(OUT / "fig_gen_typicality.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 
-# 10. Per feature: which of the 1,024 features shift, and which separate classes on one set but not the other
-# both test sets hold every class in the same proportion (50 and 10 per class), so a difference in a feature's
-# mean is not caused by a different class mix. Welch's t-test per feature, FDR-corrected, and Cohen's d.
+# 10. Per feature
+# Welch t-test and Cohen's d per feature; both sets have the same class mix
 X1, X2 = X["test1"], X["test2"]
 _, p_feat = stats.ttest_ind(X2, X1, axis=0, equal_var=False)
 d = (X2.mean(axis=0) - X1.mean(axis=0)) / np.sqrt((X1.var(axis=0, ddof=1) + X2.var(axis=0, ddof=1)) / 2)
 
 
-# separability = eta squared, the share of a feature's variance that lies between class means. It rises when
-# there are fewer images per class, so test set 1 is subsampled to 10 per class to match test set 2.
+# separability = share of variance between class means; test1 cut to 10 per class to match test2
 def eta_squared(Z, labels):
     counts = np.bincount(labels, minlength=N_CLASSES)
     means = np.zeros((N_CLASSES, Z.shape[1]))
@@ -405,9 +368,8 @@ plt.savefig(OUT / "fig_gen_feature_dimensions.png", dpi=150, bbox_inches="tight"
 plt.close()
 
 
-# 11. Clustering: k-means on the training features (Lab 3), then every test image assigned to its nearest cluster.
-# Clusters gather visually similar classes (e.g. dogs, birds), so each holds ~200 test set 2 images: enough to
-# test a cluster's gap, which a single class (10 images) is not.
+# 11. Clustering
+# k-means fitted on train_small; ~200 test set 2 images per cluster, enough to test a gap
 pca = PCA(n_components=PCA_DIMS, random_state=SEED).fit(X_small)
 kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=3, random_state=SEED).fit(pca.transform(X_small))
 cluster = {t: kmeans.predict(pca.transform(X[t])) for t in y}
@@ -423,11 +385,10 @@ for k in range(N_CLUSTERS):
                     "share_test1": m1.mean(), "share_test2": m2.mean(), "over_representation": m2.mean() / m1.mean(),
                     "acc_test1": a1.mean(), "acc_test2": a2.mean() if m2.any() else np.nan,
                     "gap": a1.mean() - a2.mean() if m2.any() else np.nan, "p_value": p,
-                    # share of the overall gap that comes from this cluster
                     "gap_contribution": (a1.sum() / n["test1"] - a2.sum() / n["test2"])})
 clusters = pd.DataFrame(cl_rows)
 clusters["q_value"] = stats.false_discovery_control(clusters.p_value.fillna(1))
-clusters["gap_contribution"] /= clusters.gap_contribution.sum()
+clusters["gap_contribution"] /= clusters.gap_contribution.sum()      # share of the overall gap
 clusters.sort_values("gap", ascending=False).to_csv(OUT / "gen_clusters.csv", index=False)
 table = np.vstack([np.bincount(cluster[t], minlength=N_CLUSTERS) for t in y])
 chi2, p_chi2 = stats.chi2_contingency(table[:, table.sum(axis=0) > 0])[:2]
@@ -458,7 +419,7 @@ plt.savefig(OUT / "fig_gen_clusters.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 
-# 12. The images: misclassified ImageNetV2 images of the classes with the strongest drop
+# 12. Misclassified ImageNetV2 images
 v2_dir = args.v2_images
 meta2 = pd.read_csv(PROC / "test2_meta.csv")
 if (v2_dir / meta2.path[0]).exists():
