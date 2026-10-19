@@ -1,0 +1,264 @@
+# 05_generalisation_analysis.py - Part 5: generalisation analysis (Rifa)
+#
+# Why is accuracy lower on test set 2 (ImageNetV2) than on test set 1 (ImageNet val)?
+# Reads the per-image predictions saved by the three classifier scripts, then compares the two test sets
+#   overall (with a confidence interval on the gap),
+#   with and without the test set 1 images whose features exactly match a training image,
+#   per class (with a significance test, because test set 2 has only 10 images per class),
+#   and in feature space (class-centroid shift, measured against a sampling-noise baseline).
+# Nothing here fits or tunes a model: the test sets are only read. Run after the three classifier scripts.
+
+import hashlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")                      # figures are saved, never shown, so the script runs without a display
+import matplotlib.pyplot as plt
+from scipy import stats
+
+plt.rcParams.update({"font.size": 11})
+
+ROOT = Path(__file__).resolve().parent.parent
+PROC = ROOT / "data" / "processed"
+OUT = ROOT / "data" / "output"
+INFO = ROOT / "timm" / "data" / "_info"    # ImageNet class ids and names, shipped with timm
+OUT.mkdir(parents=True, exist_ok=True)
+
+SEED = 7
+N_CLASSES = 1000
+NULL_SPLITS = 20                           # random splits per class for the centroid-shift noise baseline
+BLUE, ORANGE, GREY = "#2a78d6", "#eb6834", "#888888"
+
+# Classifier A is the one chosen for part (a): it has the best top-1 on our validation set
+# (A 95.23%, B 95.01%, C 94.64%). Per-class and feature-space results use it.
+NAMES = {"A": "Regularised linear", "B": "Small MLP", "C": "Nearest centroid"}
+PRIMARY = "A"
+
+
+# 1. Labels, features and class names
+y = {t: np.load(PROC / f"{t}_y.npy").astype(int) for t in ("test1", "test2")}
+X = {t: np.load(PROC / f"{t}_X.npy") for t in ("test1", "test2")}
+n = {t: len(y[t]) for t in y}
+print("test1 rows:", n["test1"], " test2 rows:", n["test2"])
+
+# label i is the i-th WordNet id in imagenet_synsets.txt; the test set 1 paths (val/<wnid>/...) confirm it
+wnids = (INFO / "imagenet_synsets.txt").read_text().split()
+lemmas = dict(line.split("\t", 1) for line in (INFO / "imagenet_synset_to_lemma.txt").read_text().splitlines())
+class_name = np.array([lemmas[w].split(",")[0] for w in wnids])
+meta1 = pd.read_csv(PROC / "test1_meta.csv")
+if not (meta1.path.str.split("/").str[1].to_numpy() == np.array(wnids)[y["test1"]]).all():
+    raise ValueError("Class names do not line up with the labels")
+
+
+# 2. Load the predictions of each classifier
+# each script saves its own format; all are turned into an (n, k) array of predicted classes, best first
+# (k = 5 when the top-5 is saved, k = 1 when only the top-1 is)
+def read_a(test):        # code/classifier_a_evaluate.py
+    df = pd.read_csv(OUT / f"classifier_a_{test}_predictions.csv")
+    return df.true_label.to_numpy(), df[[f"top{k}_label" for k in range(1, 6)]].to_numpy()
+
+
+def read_b(test):        # code/03_mlp_classifier.py: one file for both test sets
+    df = pd.read_csv(OUT / "mlp_predictions.csv")
+    df = df[df.test_set == test].sort_values("row")
+    top = [c for c in ("pred1", "pred2", "pred3", "pred4", "pred5") if c in df] or ["pred"]
+    return df.label.to_numpy(), df[top].to_numpy()
+
+
+def read_c(test):        # code/03_nearest_centroid.py
+    df = pd.read_csv(OUT / f"ncm_predictions_{test}.csv").sort_values("row")
+    return df.label.to_numpy(), df[[f"pred{k}" for k in range(1, 6)]].to_numpy()
+
+
+preds = {}
+for clf, reader in (("A", read_a), ("B", read_b), ("C", read_c)):
+    try:
+        loaded = {t: reader(t) for t in ("test1", "test2")}
+    except FileNotFoundError as e:
+        print(f"Skipping classifier {clf}: {e.filename} not found (run its script first)")
+        continue
+    for t, (labels, _) in loaded.items():
+        # the rows must be in the same order as data/processed/<test>_y.npy, or every comparison below is wrong;
+        # matching labels catch a wrong or truncated file, not a reshuffle within one class
+        if not np.array_equal(labels, y[t]):
+            raise ValueError(f"Classifier {clf}, {t}: labels do not match {t}_y.npy (wrong, truncated or reordered file)")
+    preds[clf] = {t: top for t, (_, top) in loaded.items()}
+if PRIMARY not in preds:
+    raise SystemExit(f"Classifier {PRIMARY} predictions are needed; run code/classifier_a_evaluate.py first")
+classifiers = list(preds)
+print("Loaded predictions for", [NAMES[c] for c in classifiers])
+
+
+# 3. Overall accuracy and the gap
+# the gap's 95% interval treats the two test sets as independent samples: SE = sqrt(p1 q1 / n1 + p2 q2 / n2)
+def gap_row(clf, label, correct1, correct2, top5_1=np.nan, top5_2=np.nan):
+    p1, p2 = correct1.mean(), correct2.mean()
+    se = np.sqrt(p1 * (1 - p1) / len(correct1) + p2 * (1 - p2) / len(correct2))
+    return {"classifier": NAMES[clf], "test1_rows": len(correct1), "test1_top1": p1, "test2_top1": p2,
+            "test1_top5": top5_1, "test2_top5": top5_2,
+            "gap": p1 - p2, "gap_ci_low": p1 - p2 - 1.96 * se, "gap_ci_high": p1 - p2 + 1.96 * se, "subset": label}
+
+
+correct = {c: {t: preds[c][t][:, 0] == y[t] for t in y} for c in classifiers}
+rows = []
+for c in classifiers:
+    # top-5 only when the script saved five predictions per row (the MLP currently saves the top-1 only)
+    top5 = {t: (preds[c][t] == y[t][:, None]).any(axis=1).mean() if preds[c][t].shape[1] == 5 else np.nan
+            for t in y}
+    rows.append(gap_row(c, "all test1", correct[c]["test1"], correct[c]["test2"], top5["test1"], top5["test2"]))
+
+
+# 4. Test set 1 images whose features exactly match a training image
+# identical 1,024-d vectors mean identical input images. Every match found so far carries a different label
+# from its training twin, mostly a neighbouring class (e.g. tiger shark / great white shark), so these
+# images are label-ambiguous. They lower test set 1 accuracy, which hides part of the gap.
+def row_hash(r):
+    return hashlib.md5(r.tobytes()).digest()
+
+
+test1_hash = {}
+for i, r in enumerate(X["test1"]):
+    test1_hash.setdefault(row_hash(r), []).append(i)
+X_train = np.load(PROC / "train_full_X.npy", mmap_mode="r")      # 5 GB, so read 100,000 rows at a time
+duplicate = np.zeros(n["test1"], dtype=bool)
+for start in range(0, len(X_train), 100_000):
+    for r in np.asarray(X_train[start:start + 100_000]):
+        for i in test1_hash.get(row_hash(r), ()):
+            duplicate[i] = True
+print(f"\n{duplicate.sum()} test1 images have the same features as a training image")
+
+for c in classifiers:
+    rows.append(gap_row(c, "test1 without training duplicates", correct[c]["test1"][~duplicate], correct[c]["test2"]))
+    rows.append(gap_row(c, "test1 training duplicates only", correct[c]["test1"][duplicate], correct[c]["test2"]))
+overall = pd.DataFrame(rows)
+overall.to_csv(OUT / "gen_overall_accuracy.csv", index=False)
+print("\n=== Top-1 gap (test1 - test2), with 95% interval ===")
+print(overall[["classifier", "subset", "test1_rows", "test1_top1", "test2_top1", "test1_top5", "test2_top5",
+               "gap", "gap_ci_low", "gap_ci_high"]].round(4).to_string(index=False))
+
+
+# 5. Per-class accuracy, tested for significance
+# test set 2 has 10 images per class, so one image moves a class's accuracy by 10 points; a raw ranking of
+# per-class gaps is mostly noise. Each class gets Fisher's exact test (test1 50 images vs test2 10 images),
+# and the 1,000 p-values are corrected for multiple testing (Benjamini-Hochberg false discovery rate).
+def per_class(clf):
+    k1 = np.bincount(y["test1"], weights=correct[clf]["test1"], minlength=N_CLASSES)
+    k2 = np.bincount(y["test2"], weights=correct[clf]["test2"], minlength=N_CLASSES)
+    n1 = np.bincount(y["test1"], minlength=N_CLASSES)
+    n2 = np.bincount(y["test2"], minlength=N_CLASSES)
+    p = np.array([stats.fisher_exact([[k1[c], n1[c] - k1[c]], [k2[c], n2[c] - k2[c]]])[1] for c in range(N_CLASSES)])
+    return pd.DataFrame({"class": np.arange(N_CLASSES), "name": class_name, "acc_test1": k1 / n1, "acc_test2": k2 / n2,
+                         "gap": k1 / n1 - k2 / n2, "p_value": p, "q_value": stats.false_discovery_control(p)})
+
+
+class_gaps = {c: per_class(c) for c in classifiers}
+for c in classifiers:
+    class_gaps[c].to_csv(OUT / f"gen_perclass_{c}.csv", index=False)
+pc = class_gaps[PRIMARY]
+
+# what the per-class gaps would look like if nothing differed between the test sets: every class keeps one
+# accuracy (pooled over both sets) and only the random draw of 50 and 10 images varies
+rng = np.random.default_rng(SEED)
+pooled = (pc.acc_test1 * 50 + pc.acc_test2 * 10) / 60
+null_gaps = (rng.binomial(50, np.tile(pooled, 20)) / 50 - rng.binomial(10, np.tile(pooled, 20)) / 10)
+print(f"\nPer-class gap ({NAMES[PRIMARY]}): sd {pc.gap.std():.3f} observed vs {null_gaps.std():.3f} expected from "
+      f"sampling noise alone; {(pc.q_value < 0.05).sum()} of 1000 classes differ significantly (FDR 5%)")
+
+worst = pc.sort_values(["q_value", "gap"], ascending=[True, False]).head(20)
+print("\n=== 20 classes with the strongest evidence of a drop ===")
+print(worst[["class", "name", "acc_test1", "acc_test2", "gap", "p_value", "q_value"]].round(3).to_string(index=False))
+
+
+# 6. Error patterns on those classes
+# for the 10 classes above, the most common wrong predictions on test set 2, for every classifier
+errors = []
+for c in classifiers:
+    for k in worst["class"].head(10):
+        wrong = (y["test2"] == k) & ~correct[c]["test2"]
+        for pred, count in pd.Series(preds[c]["test2"][wrong, 0]).value_counts().head(3).items():
+            errors.append({"classifier": NAMES[c], "true_class": k, "true_name": class_name[k],
+                           "predicted_as": pred, "predicted_name": class_name[pred],
+                           "count": count, "frac_of_errors": count / wrong.sum()})
+pd.DataFrame(errors).to_csv(OUT / "gen_error_patterns.csv", index=False)
+print("\nError patterns saved to gen_error_patterns.csv")
+
+
+# 7. Feature space: how far each class's centroid moves between the test sets
+# a centroid of 10 images is noisy, so two samples of the SAME distribution already sit apart. The baseline
+# is the distance between the centroids of 10 random test1 images and the other 40 of that class
+# (NULL_SPLITS random splits, averaged); "excess" = observed distance minus that baseline.
+centroid_dist, baseline = np.zeros(N_CLASSES), np.zeros(N_CLASSES)
+for k in range(N_CLASSES):
+    A, B = X["test1"][y["test1"] == k], X["test2"][y["test2"] == k]
+    centroid_dist[k] = np.linalg.norm(A.mean(axis=0) - B.mean(axis=0))
+    splits = [rng.permutation(len(A)) for _ in range(NULL_SPLITS)]
+    baseline[k] = np.mean([np.linalg.norm(A[s[:10]].mean(axis=0) - A[s[10:]].mean(axis=0)) for s in splits])
+shift = pd.DataFrame({"class": np.arange(N_CLASSES), "name": class_name, "centroid_distance": centroid_dist,
+                      "noise_baseline": baseline, "excess_shift": centroid_dist - baseline, "gap": pc.gap})
+shift.sort_values("excess_shift", ascending=False).to_csv(OUT / "gen_feature_shift.csv", index=False)
+
+print(f"\n=== Centroid shift: mean distance {centroid_dist.mean():.2f}, noise baseline {baseline.mean():.2f}; "
+      f"larger than the baseline in {(centroid_dist > baseline).mean():.1%} of classes ===")
+print(shift.sort_values("excess_shift", ascending=False).head(10).round(3).to_string(index=False))
+for c in classifiers:
+    g = class_gaps[c].gap
+    print(f"{NAMES[c]}: correlation of excess shift with the class gap  Pearson {np.corrcoef(shift.excess_shift, g)[0, 1]:.3f}"
+          f"  Spearman {stats.spearmanr(shift.excess_shift, g)[0]:.3f}")
+
+
+# 8. Figures
+# 8a. top-1 on both test sets, with the binomial 95% interval of each accuracy
+main = overall[overall.subset == "all test1"]
+fig, ax = plt.subplots(figsize=(7.5, 4))
+x, w = np.arange(len(main)), 0.35
+for offset, t, color, label in ((-w / 2, "test1", BLUE, "test set 1 (ImageNet val)"),
+                                (w / 2, "test2", ORANGE, "test set 2 (ImageNetV2)")):
+    acc = main[f"{t}_top1"].to_numpy()
+    ax.bar(x + offset, acc, w, color=color, label=label, yerr=1.96 * np.sqrt(acc * (1 - acc) / n[t]), capsize=3)
+    for i, a in enumerate(acc):
+        ax.text(i + offset, a + 0.025, f"{100 * a:.1f}%", ha="center", fontsize=9)
+ax.set_xticks(x, main.classifier)
+ax.set_ylabel("Top-1 accuracy")
+ax.set_ylim(0, 1.15)
+ax.legend(frameon=False, loc="upper center", ncol=2)
+ax.set_title("Generalisation gap: ImageNet val vs ImageNetV2")
+ax.spines[["top", "right"]].set_visible(False)
+plt.savefig(OUT / "fig_gen_overall.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# 8b. per-class gaps against what sampling noise alone would produce
+fig, ax = plt.subplots(figsize=(6.5, 3.8))
+bins = np.linspace(-1, 1, 41)
+ax.hist(pc.gap, bins=bins, color=BLUE, alpha=0.85, edgecolor="white", label="observed")
+ax.hist(null_gaps, bins=bins, weights=np.full(len(null_gaps), 1 / 20), histtype="step", color="k", lw=1.2,
+        label="sampling noise only")
+ax.axvline(0, color=GREY, lw=1)
+ax.set_xlabel("Per-class top-1 gap (test1 - test2)")
+ax.set_ylabel("Number of classes")
+ax.set_title(f"Per-class gaps, {NAMES[PRIMARY]}")
+ax.legend(frameon=False)
+ax.spines[["top", "right"]].set_visible(False)
+plt.savefig(OUT / "fig_gen_gap_hist.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# 8c. excess centroid shift vs the class gap; significant classes highlighted
+fig, ax = plt.subplots(figsize=(6.2, 5))
+significant = (pc.q_value < 0.05).to_numpy()
+jitter = rng.uniform(-0.015, 0.015, N_CLASSES)       # gaps come in steps of 0.02 / 0.1, so points would stack
+ax.scatter(shift.excess_shift[~significant], pc.gap[~significant] + jitter[~significant], s=14, alpha=0.5, color=BLUE,
+           label="not significant")
+ax.scatter(shift.excess_shift[significant], pc.gap[significant] + jitter[significant], s=22, color=ORANGE,
+           label="significant drop (FDR 5%)")
+ax.axvline(0, color=GREY, lw=1)
+ax.set_xlabel("Centroid shift beyond sampling noise (test1 vs test2)")
+ax.set_ylabel(f"Per-class top-1 gap ({NAMES[PRIMARY]})")
+ax.set_title("Feature shift vs generalisation gap")
+ax.legend(frameon=False, loc="lower right")
+ax.spines[["top", "right"]].set_visible(False)
+plt.savefig(OUT / "fig_gen_shift_vs_gap.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+print("\nTables and figures saved to data/output/: gen_*.csv, fig_gen_overall.png, fig_gen_gap_hist.png, "
+      "fig_gen_shift_vs_gap.png")
