@@ -92,3 +92,12 @@ took about 3 seconds.
 - The EVA-02 features already work well with a simple distance. Normalisation, PCA and LDA did not make them better.
 - A few images per class are enough to place a good centroid.
 - Even this simple classifier has a gap of 7.3 points between the two test sets.
+
+## Lessons learnt (Trung, for section 7)
+
+1. Good pretrained features do most of the work. A very simple classifier on EVA-02 features came within about
+   0.1 points of the best variant we tried.
+2. When results differ by less than the noise, pick the simplest model. Many of our variants looked different but
+   were not really better.
+3. For a very large dataset, a method that only needs sums can be trained in one pass over the data, without loading
+   it all into memory.
